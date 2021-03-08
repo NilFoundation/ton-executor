@@ -37,5 +37,5 @@ log = "0.4.8"
 
 
 base64 = "0.10.0"
-ton_labs_assembler = { git = "https://github.com/nilfoundation/tvm-asm.git", branch = " 1-vergrth16" }
+ton_labs_assembler = { git = "https://github.com/nilfoundation/tvm-asm.git", branch = "1-vergrth16" }
 

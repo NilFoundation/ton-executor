@@ -11,7 +11,6 @@
 * limitations under the License.
 */
 
-
 use crate::{
     blockchain_config::{BlockchainConfig, CalcMsgFwdFees}, error::ExecutorError,
     TransactionExecutor,
@@ -21,14 +20,13 @@ use std::sync::{atomic::{AtomicU64, Ordering}, Arc};
 #[cfg(feature="timings")]
 use std::time::Instant;
 use ton_block::{
-    AddSub, CurrencyCollection, Serializable, Deserializable,
-    Account, AccStatusChange, CommonMsgInfo, Message, HashUpdate,
-    Transaction, TransactionDescrOrdinary, TransactionDescr,
-    TrComputePhase,
+    Grams, CurrencyCollection, Serializable,
+    Account, AccStatusChange, CommonMsgInfo, Message,
+    Transaction, TransactionDescrOrdinary, TransactionDescr, TrComputePhase,
 };
-use ton_types::{Cell, error, fail, Result, HashmapE};
+use ton_types::{error, fail, Result, HashmapE};
 use ton_vm::{
-    int, stack::{Stack, StackItem, integer::IntegerData}
+    boolean, int, stack::{Stack, StackItem, integer::IntegerData}
 };
 
 
@@ -36,7 +34,7 @@ pub struct OrdinaryTransactionExecutor {
     config: BlockchainConfig,
 
     #[cfg(feature="timings")]
-    timings: [AtomicU64; 3],
+    timings: [AtomicU64; 3], // 0 - preparation, 1 - compute, 2 - after compute
 }
 
 impl OrdinaryTransactionExecutor {
@@ -58,10 +56,10 @@ impl OrdinaryTransactionExecutor {
 impl TransactionExecutor for OrdinaryTransactionExecutor {
     ///
     /// Create end execute transaction from message for account
-    fn execute_with_libs(
+    fn execute_for_account(
         &self,
         in_msg: Option<&Message>,
-        account_root: &mut Cell,
+        account: &mut Account,
         state_libs: HashmapE, // masterchain libraries
         block_unixtime: u32,
         block_lt: u64,
@@ -71,32 +69,25 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
         #[cfg(feature="timings")]
         let mut now = Instant::now();
 
-        let in_msg = match in_msg {
-            Some(in_msg) => in_msg,
-            None => fail!("Ordinary transaction must have input message")
-        };
-        log::debug!(target: "executor", "Ordinary transaction executing, in message id: {:x}",
-            in_msg.get_int_src_account_id().unwrap_or_default());
-        
+        let in_msg = in_msg.ok_or_else(|| error!("Ordinary transaction must have input message"))?;
+        let msg_cell = in_msg.serialize()?; // TODO: get from outside
+        log::debug!(target: "executor", "Ordinary transaction executing, in message id: {:x}", msg_cell.repr_hash());
         let (credit_first, is_ext_msg) = match in_msg.header() {
             CommonMsgInfo::ExtOutMsgInfo(_) => fail!(ExecutorError::InvalidExtMessage),
             CommonMsgInfo::IntMsgInfo(ref hdr) => (!hdr.bounce, false),
             CommonMsgInfo::ExtInMsgInfo(_) => (true, true)
         };
 
-        let mut account = Account::construct_from(&mut account_root.clone().into())?;
-
-        let old_hash = account_root.repr_hash();
-        let account_address = &in_msg.dst()
-            .ok_or_else(|| ExecutorError::TrExecutorError("Input message has no dst address".to_string()))?;
+        let account_address = in_msg.dst_ref().ok_or_else(|| ExecutorError::TrExecutorError(
+            format!("Input message {:x} has no dst address", msg_cell.repr_hash())
+        ))?;
         match account.get_id() {
             Some(account_id) => log::debug!(target: "executor", "Account = {:x}", account_id),
-            None => log::debug!(target: "executor",
-                "Account = None, msg address = {:x}", in_msg.int_dst_account_id().unwrap_or_default())
+            None => log::debug!(target: "executor", "Account = None, address = {}", account_address)
         }
 
-        let acc_balance = account.get_balance().map(|value| value.grams.0).unwrap_or_default();
-        log::debug!(target: "executor", "acc_balance: {}, credit_first: {}", acc_balance, credit_first);
+        let acc_balance = account.balance().cloned().unwrap_or_default();
+        log::debug!(target: "executor", "acc_balance: {}, credit_first: {}", acc_balance.grams, credit_first);
 
         let is_special = self.config.is_special_account(account_address)?;
         let lt = last_tr_lt.load(Ordering::Relaxed);
@@ -110,9 +101,9 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
 
         // first check if contract can pay for importing external message
         if is_ext_msg && !is_special {
-            let (_, in_fwd_fee) = self.config.get_fwd_prices(in_msg.is_masterchain()).fwd_fee(&in_msg.serialize()?);
+            let in_fwd_fee = self.config.get_fwd_prices(in_msg.is_masterchain()).fwd_fee(&in_msg.serialize()?);
             let in_fwd_fee = CurrencyCollection::from_grams(in_fwd_fee);
-            log::debug!(target: "executor", "import message fee: {}, acc_balance: {}", in_fwd_fee.grams, acc_balance);
+            log::debug!(target: "executor", "import message fee: {}, acc_balance: {}", in_fwd_fee.grams, acc_balance.grams);
             if !account.sub_funds(&in_fwd_fee)? {
                 fail!(ExecutorError::NoFundsToImportMsg)
             }
@@ -120,32 +111,39 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
         }
 
         if description.credit_first && !is_ext_msg {
-            description.credit_ph = self.credit_phase(&in_msg, &mut account);
+            description.credit_ph = self.credit_phase(&in_msg, account);
         }
-        description.storage_ph = self.storage_phase(&mut account, &mut tr, is_special);
+        description.storage_ph = self.storage_phase(account, &mut tr, is_special);
         log::debug!(target: "executor",
             "storage_phase: {}", if description.storage_ph.is_some() {"present"} else {"none"});
 
         if !description.credit_first && !is_ext_msg {
-            description.credit_ph = self.credit_phase(&in_msg, &mut account);
+            description.credit_ph = self.credit_phase(&in_msg, account);
         }
         log::debug!(target: "executor", 
             "credit_phase: {}", if description.credit_ph.is_some() {"present"} else {"none"});
 
-        #[cfg(feature="timings")]
-        {
+        #[cfg(feature="timings")] {
             self.timings[0].fetch_add(now.elapsed().as_micros() as u64, Ordering::SeqCst);
             now = Instant::now();
         }
 
         let smci = self.build_contract_info(self.config.raw_config(), &account, &account_address, block_unixtime, block_lt, lt); 
         log::debug!(target: "executor", "compute_phase");
+        let mut stack = Stack::new();
+        stack
+            .push(int!(acc_balance.grams.0))
+            .push(int!(msg_remaining_balance.grams.0))
+            .push(StackItem::Cell(msg_cell))
+            .push(StackItem::Slice(in_msg.body().unwrap_or_default()))
+            .push(boolean!(is_ext_msg));
+        
         let (compute_ph, actions) = self.compute_phase(
             Some(&in_msg), 
-            &mut account,
+            account,
             state_libs,
             &smci,
-            self,
+            stack,
             is_special,
             debug
         )?;
@@ -155,12 +153,12 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
         description.compute_ph = compute_ph;
         description.action = match description.compute_ph {
             TrComputePhase::Vm(ref phase) => {
-                tr.total_fees_mut().add(&CurrencyCollection::from_grams(phase.gas_fees.clone()))?;
+                tr.add_fee_grams(&phase.gas_fees)?;
                 if phase.success {
                     log::debug!(target: "executor", "compute_phase: success");
                     log::debug!(target: "executor", "action_phase: lt={}", lt);
                     gas_fees = None;
-                    match self.action_phase(&mut tr, &mut account, &mut msg_remaining_balance, actions.unwrap_or_default(), is_special) {
+                    match self.action_phase(&mut tr, account, &mut msg_remaining_balance, actions.unwrap_or_default(), is_special) {
                         Some((action_ph, msgs)) => {
                             out_msgs = msgs;
                             Some(action_ph)
@@ -179,37 +177,39 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
                 if is_ext_msg {
                     fail!(ExecutorError::ExtMsgComputeSkipped(skipped.reason.clone()))
                 }
-                gas_fees = Some(Default::default());
+                gas_fees = Some(Grams::default());
                 None
             }
         };
 
-        #[cfg(feature="timings")]
-        self.timings[1].fetch_add(now.elapsed().as_micros() as u64, Ordering::SeqCst);
+        #[cfg(feature="timings")] {
+            self.timings[1].fetch_add(now.elapsed().as_micros() as u64, Ordering::SeqCst);
+            now = Instant::now();
+        }
 
-        description.aborted = match description.action {
-            Some(ref phase) => {
+        description.aborted = match description.action.as_ref() {
+            Some(phase) => {
                 log::debug!(target: "executor", 
                     "action_phase: present: success={}, err_code={}", phase.success, phase.result_code);
                 match phase.status_change {
-                    AccStatusChange::Deleted => account = Account::default(),
+                    AccStatusChange::Deleted => *account = Account::default(),
                     AccStatusChange::Frozen => account.try_freeze()?,
                     _ => ()
                 }
                 !phase.success
-            },
+            }
             None => {
                 log::debug!(target: "executor", "action_phase: none");
                 true
-            },
+            }
         };
-        
+
         log::debug!(target: "executor", "Desciption.aborted {}", description.aborted);
         tr.set_end_status(account.status());
         if description.aborted {
             if let Some(gas_fees) = gas_fees {
                 log::debug!(target: "executor", "bounce_phase");
-                description.bounce = match self.bounce_phase(&in_msg, &mut account, &mut tr, gas_fees) {
+                description.bounce = match self.bounce_phase(&in_msg, account, &mut tr, gas_fees) {
                     Some((bounce_ph, Some(bounce_msg))) => {
                         out_msgs.push(bounce_msg);
                         Some(bounce_ph)
@@ -219,20 +219,14 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
                 };
             }
             if description.bounce.is_none() {
-                account = old_account
+                *account = old_account
             }
         }
-        log::debug!(target: "executor", "calculate Hash update");
         let lt = self.add_messages(&mut tr, out_msgs, last_tr_lt)?;
         account.set_last_tr_time(lt);
-        *account_root = account.serialize()?;
-        let new_hash = account_root.repr_hash();
-        tr.write_state_update(&HashUpdate::with_hashes(old_hash, new_hash))?;
         tr.write_description(&TransactionDescr::Ordinary(description))?;
-
         #[cfg(feature="timings")]
         self.timings[2].fetch_add(now.elapsed().as_micros() as u64, Ordering::SeqCst);
-
         Ok(tr)
     }
     fn ordinary_transaction(&self) -> bool { true }
@@ -243,15 +237,10 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
             Some(in_msg) => in_msg,
             None => return stack
         };
-        let account_balance = int!(account.get_balance().map(|value| value.grams.0.clone()).unwrap_or_default());
+        let account_balance = int!(account.balance().map(|value| value.grams.0.clone()).unwrap_or_default());
         let msg_balance = int!(in_msg.get_value().map(|val| val.grams.0).unwrap_or_default());
-        let function_selector = match in_msg.header() {
-            CommonMsgInfo::IntMsgInfo(_) => int!(0),
-            _ => int!(-1),
-        };
-
+        let function_selector = boolean!(in_msg.is_inbound_external());
         let body_slice = in_msg.body().unwrap_or_default();
-
         let msg_cell = in_msg.serialize().unwrap_or_default();
         stack
             .push(account_balance)
